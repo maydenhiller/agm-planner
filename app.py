@@ -15,45 +15,35 @@ import simplekml
 
 # ---- spacing rules ----
 HARD_MIN_MI = 0.40
-HARD_MAX_MI = 1.40
-PREF_MIN_MI = 0.90
 PREF_MAX_MI = 1.10
-TARGET_MI = 1.00
+HARD_MAX_MI = 1.40
 
-# ensure last AGM always added
+TARGET_MI = 1.00  # only a tiebreaker now (NOT the main objective)
+
+# always add last AGM
 ALWAYS_END_AGM = True
 
-# reachability rule
-REACHABLE_GAP_METERS = 201.168  # 1/8 mile
+# reachability rule (truck within 1/8 mile of target)
+REACHABLE_GAP_METERS = 201.168
 
-# parking heuristic
-PARK_OFFSET_MI = 0.02  # downstream favored first
+# parking heuristic: when aiming for a candidate, try slightly downstream first
+PARK_OFFSET_MI = 0.02  # ~105 ft
 
 # candidate sampling / cost controls
 CANDIDATE_STEP_MI = 0.05
-MAX_CANDIDATES_PER_BAND = 21  # set to 11 if you want faster
+MAX_CANDIDATES_PER_BAND = 21  # set to 11 for faster
+
+# "decent road-ish option" threshold inside 0.40–1.10
+# If nothing inside the preferred band gets within this gap, we allow 1.10–1.40.
+PREFERRED_BAND_GOOD_GAP_METERS = 400.0
 
 
 @dataclass
 class Agm:
-    idx: int  # 0,1,2,... => 000,010,020...
+    idx: int
     along_mi: float
     lon: float
     lat: float
-
-
-@dataclass
-class Hop:
-    from_idx: int
-    to_idx: int
-    from_along_mi: float
-    to_along_mi: float
-    pipeline_segment_mi: float
-    driving_mi: float
-    end_gap_m: float
-    reachable: bool
-    mapbox_ok: bool
-    used_offset: str  # downstream|none|upstream
 
 
 def mi_to_m(mi: float) -> float:
@@ -102,9 +92,7 @@ def parse_first_linestring_coords_from_kml(kml_text: str) -> List[Tuple[float, f
         parts = token.split(",")
         if len(parts) < 2:
             continue
-        lon = float(parts[0])
-        lat = float(parts[1])
-        coords.append((lon, lat))
+        coords.append((float(parts[0]), float(parts[1])))
 
     if len(coords) < 2:
         raise ValueError("LineString had fewer than 2 coordinate points.")
@@ -178,9 +166,9 @@ def mapbox_directions_driving(token: str, a: Tuple[float, float], b: Tuple[float
     return r.json()
 
 
-def route_to_lonlat(token: str, a: Agm, b_lonlat: Tuple[float, float]) -> Tuple[float, float, bool]:
+def route_to_lonlat(token: str, a_lonlat: Tuple[float, float], b_lonlat: Tuple[float, float]) -> Tuple[float, float, bool]:
     try:
-        data = mapbox_directions_driving(token, (a.lon, a.lat), b_lonlat)
+        data = mapbox_directions_driving(token, a_lonlat, b_lonlat)
     except Exception:
         return (float("inf"), float("inf"), False)
 
@@ -214,79 +202,118 @@ def make_s_values(start_s: float, end_s: float) -> List[float]:
     return vals
 
 
-def pick_next_agm_along(
+def best_parking_variant_for_candidate(
+    token: str,
+    center_coords: List[Tuple[float, float]],
+    cum_m: List[float],
+    prev_agm: Agm,
+    cand_along_mi: float,
+) -> Tuple[float, float, str, float, float, bool]:
+    """
+    For this candidate along-mile, try downstream first, then none, then upstream.
+    Return the best (lon,lat, used_offset, driving_mi, end_gap_m, ok).
+    """
+    total_mi = m_to_mi(cum_m[-1])
+
+    variants = [
+        ("downstream", min(total_mi, cand_along_mi + PARK_OFFSET_MI)),
+        ("none", cand_along_mi),
+        ("upstream", max(0.0, cand_along_mi - PARK_OFFSET_MI)),
+    ]
+
+    best = None
+    for label, s in variants:
+        lon, lat = interpolate_point(center_coords, cum_m, mi_to_m(s))
+        driving_mi, end_gap_m, ok = route_to_lonlat(token, (prev_agm.lon, prev_agm.lat), (lon, lat))
+        reachable = (end_gap_m <= REACHABLE_GAP_METERS)
+
+        # Prefer reachable immediately (downstream is tested first)
+        if reachable:
+            return (lon, lat, label, driving_mi, end_gap_m, ok)
+
+        cur = (end_gap_m, driving_mi, ok, lon, lat, label)
+        if best is None or cur[0] < best[0] or (cur[0] == best[0] and cur[1] < best[1]):
+            best = cur
+
+    assert best is not None
+    return (best[3], best[4], best[5], best[1], best[0], best[2])
+
+
+def pick_next_agm(
     token: str,
     center_coords: List[Tuple[float, float]],
     cum_m: List[float],
     prev: Agm,
     end_along_mi: float,
 ) -> Optional[Agm]:
+    """
+    Your requested rule:
+    - Prefer road crossings in 0.40–1.10 (i.e., prefer smallest end-gap in that band)
+    - Only if that band has no decent road-ish option, allow 1.10–1.40
+    """
     hard_min = prev.along_mi + HARD_MIN_MI
-    hard_max = min(prev.along_mi + HARD_MAX_MI, end_along_mi)
     if hard_min > end_along_mi:
         return None
 
-    pref_min = max(prev.along_mi + PREF_MIN_MI, hard_min)
-    pref_max = min(prev.along_mi + PREF_MAX_MI, hard_max)
+    band1_lo = hard_min
+    band1_hi = min(prev.along_mi + PREF_MAX_MI, end_along_mi)
 
-    bands: List[Tuple[str, float, float]] = []
-    if pref_min <= pref_max:
-        bands.append(("preferred", pref_min, pref_max))
-    bands.append(("hard", hard_min, hard_max))
+    band2_lo = max(band1_hi, prev.along_mi + PREF_MAX_MI)
+    band2_hi = min(prev.along_mi + HARD_MAX_MI, end_along_mi)
 
-    for band_name, lo, hi in bands:
+    def score_band(lo: float, hi: float) -> List[Tuple]:
+        if lo > hi:
+            return []
         s_values = make_s_values(lo, hi)
         scored = []
-
         for s in s_values:
-            lon, lat = interpolate_point(center_coords, cum_m, mi_to_m(s))
-            driving_mi, end_gap_m, ok = route_to_lonlat(token, prev, (lon, lat))
-            reachable = (end_gap_m <= REACHABLE_GAP_METERS)
+            lon, lat, used_offset, driving_mi, end_gap_m, ok = best_parking_variant_for_candidate(
+                token, center_coords, cum_m, prev, s
+            )
             step_mi = s - prev.along_mi
-            scored.append((reachable, abs(step_mi - TARGET_MI), driving_mi, end_gap_m, ok, s, lon, lat))
+            reachable = (end_gap_m <= REACHABLE_GAP_METERS)
 
-        if band_name == "preferred" and any(x[0] for x in scored):
-            scored = [x for x in scored if x[0]]
+            # IMPORTANT scoring: road/access first, then ~1 mile tiebreak
+            scored.append(
+                (
+                    0 if reachable else 1,          # reachable first
+                    end_gap_m,                      # then closest-to-road
+                    driving_mi,                     # then shortest drive
+                    abs(step_mi - TARGET_MI),       # then closest-to-1-mile spacing
+                    s, lon, lat, used_offset, ok
+                )
+            )
+        scored.sort(key=lambda x: (x[0], x[1], x[2], x[3]))
+        return scored
 
-        scored.sort(key=lambda x: (0 if x[0] else 1, x[1], x[2], x[3]))
+    band1 = score_band(band1_lo, band1_hi)
+    if band1:
+        # if we have a "good enough" road-ish option in preferred band, take it.
+        if band1[0][1] <= PREFERRED_BAND_GOOD_GAP_METERS:
+            best = band1[0]
+            return Agm(idx=prev.idx + 1, along_mi=best[4], lon=best[5], lat=best[6])
 
-        if scored:
-            r = scored[0]
-            return Agm(idx=prev.idx + 1, along_mi=r[5], lon=r[6], lat=r[7])
+        # even if not "good", we still prefer band1 unless band2 is clearly better
+        band2 = score_band(band2_lo, band2_hi)
+        if not band2:
+            best = band1[0]
+            return Agm(idx=prev.idx + 1, along_mi=best[4], lon=best[5], lat=best[6])
 
-    return None
+        # allow band2 only if it significantly improves road access
+        # (smaller end-gap wins; if tie, band scoring already handled)
+        if band2[0][1] + 1e-6 < band1[0][1]:
+            best = band2[0]
+            return Agm(idx=prev.idx + 1, along_mi=best[4], lon=best[5], lat=best[6])
 
+        best = band1[0]
+        return Agm(idx=prev.idx + 1, along_mi=best[4], lon=best[5], lat=best[6])
 
-def adjust_for_parking(
-    token: str,
-    center_coords: List[Tuple[float, float]],
-    cum_m: List[float],
-    prev: Agm,
-    next_along_mi: float,
-) -> Tuple[Tuple[float, float], str, float, float, bool]:
-    total_mi = m_to_mi(cum_m[-1])
-
-    candidates = [
-        ("downstream", min(total_mi, next_along_mi + PARK_OFFSET_MI)),
-        ("none", next_along_mi),
-        ("upstream", max(0.0, next_along_mi - PARK_OFFSET_MI)),
-    ]
-
-    best = None
-    for label, s in candidates:
-        lon, lat = interpolate_point(center_coords, cum_m, mi_to_m(s))
-        driving_mi, end_gap_m, ok = route_to_lonlat(token, prev, (lon, lat))
-        reachable = (end_gap_m <= REACHABLE_GAP_METERS)
-
-        if reachable:
-            return ((lon, lat), label, driving_mi, end_gap_m, ok)
-
-        cur = (end_gap_m, driving_mi, ok, (lon, lat), label)
-        if best is None or cur[0] < best[0] or (cur[0] == best[0] and cur[1] < best[1]):
-            best = cur
-
-    assert best is not None
-    return (best[3], best[4], best[1], best[0], best[2])
+    # no band1 candidates (rare), fall back to band2
+    band2 = score_band(band2_lo, band2_hi)
+    if not band2:
+        return None
+    best = band2[0]
+    return Agm(idx=prev.idx + 1, along_mi=best[4], lon=best[5], lat=best[6])
 
 
 def build_kmz(center_coords: List[Tuple[float, float]], agms: List[Agm]) -> bytes:
@@ -337,88 +364,67 @@ def rows_to_csv_bytes(rows: List[Dict[str, Any]]) -> bytes:
     return out.getvalue().encode("utf-8")
 
 
-def generate_full_line(
-    token: str,
-    center_coords: List[Tuple[float, float]],
-) -> Tuple[List[Agm], List[Hop], List[Dict[str, Any]], Dict[str, Any], bytes, bytes]:
+def generate_full_line(token: str, center_coords: List[Tuple[float, float]]):
     cum_m = cumulative_distances_m(center_coords)
     total_mi = m_to_mi(cum_m[-1])
 
     lon0, lat0 = interpolate_point(center_coords, cum_m, 0.0)
-    agms_raw: List[Agm] = [Agm(idx=0, along_mi=0.0, lon=lon0, lat=lat0)]
+    agms: List[Agm] = [Agm(idx=0, along_mi=0.0, lon=lon0, lat=lat0)]
 
+    # generate interior points
     while True:
-        prev = agms_raw[-1]
-        nxt = pick_next_agm_along(token, center_coords, cum_m, prev, total_mi)
+        prev = agms[-1]
+        nxt = pick_next_agm(token, center_coords, cum_m, prev, total_mi)
         if nxt is None:
             break
 
-        if ALWAYS_END_AGM and (total_mi - nxt.along_mi) < PREF_MIN_MI:
-            break
-
-        # guard against picking same spot repeatedly
+        # prevent duplicates / non-progress
         if nxt.along_mi <= prev.along_mi + 1e-6:
             break
 
-        agms_raw.append(nxt)
-
-        if len(agms_raw) > 20000:
+        # if we're near the end, stop and we'll add the end AGM
+        if ALWAYS_END_AGM and (total_mi - nxt.along_mi) < HARD_MIN_MI:
             break
 
+        agms.append(nxt)
+
+        if len(agms) > 20000:
+            break
+
+    # force end AGM
     if ALWAYS_END_AGM:
         lonE, latE = interpolate_point(center_coords, cum_m, cum_m[-1])
-        if agms_raw[-1].along_mi < total_mi - 1e-6:
-            agms_raw.append(Agm(idx=agms_raw[-1].idx + 1, along_mi=total_mi, lon=lonE, lat=latE))
+        if agms[-1].along_mi < total_mi - 1e-6:
+            agms.append(Agm(idx=agms[-1].idx + 1, along_mi=total_mi, lon=lonE, lat=latE))
         else:
-            agms_raw[-1] = Agm(idx=agms_raw[-1].idx, along_mi=total_mi, lon=lonE, lat=latE)
+            agms[-1] = Agm(idx=agms[-1].idx, along_mi=total_mi, lon=lonE, lat=latE)
 
-    agms_adj = [Agm(idx=a.idx, along_mi=a.along_mi, lon=a.lon, lat=a.lat) for a in agms_raw]
-    hops: List[Hop] = []
+    # build one output table
     rows: List[Dict[str, Any]] = []
+    cum_pipe = 0.0
+    cum_drive = 0.0
 
-    cum_pipeline = 0.0
-    cum_driving = 0.0
+    for i in range(len(agms) - 1):
+        a = agms[i]
+        b = agms[i + 1]
 
-    for i in range(len(agms_raw) - 1):
-        a = agms_adj[i]
-        b = agms_raw[i + 1]
+        pipe_seg = b.along_mi - a.along_mi
+        cum_pipe += pipe_seg
 
-        (lonlat, used_offset, driving_mi, end_gap_m, ok) = adjust_for_parking(
-            token, center_coords, cum_m, a, b.along_mi
-        )
-        agms_adj[i + 1] = Agm(idx=b.idx, along_mi=b.along_mi, lon=lonlat[0], lat=lonlat[1])
-
-        pipe_seg = b.along_mi - agms_raw[i].along_mi
-        cum_pipeline += pipe_seg
-
-        if math.isfinite(driving_mi):
-            cum_driving += driving_mi
-
+        driving_mi, end_gap_m, ok = route_to_lonlat(token, (a.lon, a.lat), (b.lon, b.lat))
         reachable = (end_gap_m <= REACHABLE_GAP_METERS)
 
-        hops.append(
-            Hop(
-                from_idx=agms_raw[i].idx,
-                to_idx=b.idx,
-                from_along_mi=agms_raw[i].along_mi,
-                to_along_mi=b.along_mi,
-                pipeline_segment_mi=pipe_seg,
-                driving_mi=driving_mi,
-                end_gap_m=end_gap_m,
-                reachable=reachable,
-                mapbox_ok=ok,
-                used_offset=used_offset,
-            )
-        )
+        if math.isfinite(driving_mi):
+            cum_drive += driving_mi
 
         rows.append(
             {
-                "Starting AGM": agm_label(agms_raw[i].idx),
+                "Starting AGM": agm_label(a.idx),
                 "Next AGM": agm_label(b.idx),
                 "Segment Pipeline Distance": round(pipe_seg, 3),
-                "Cumulative Pipeline Distance": round(cum_pipeline, 3),
+                "Cumulative Pipeline Distance": round(cum_pipe, 3),
                 "Segment Driving Distance": "" if not math.isfinite(driving_mi) else round(driving_mi, 2),
-                "Cumulative Driving Distance": "" if not math.isfinite(driving_mi) else round(cum_driving, 2),
+                "Cumulative Driving Distance": "" if not math.isfinite(driving_mi) else round(cum_drive, 2),
                 "Reachable by truck": "Yes" if reachable else "",
                 "ATV?": "Yes" if (not reachable) else "",
             }
@@ -426,20 +432,19 @@ def generate_full_line(
 
     summary = {
         "total_line_mi": round(total_mi, 3),
-        "agm_count": len(agms_adj),
-        "hop_count": len(hops),
-        "avg_pipeline_spacing_mi": "" if len(hops) == 0 else round(sum(h.pipeline_segment_mi for h in hops) / len(hops), 3),
-        "min_pipeline_spacing_mi": "" if len(hops) == 0 else round(min(h.pipeline_segment_mi for h in hops), 3),
-        "max_pipeline_spacing_mi": "" if len(hops) == 0 else round(max(h.pipeline_segment_mi for h in hops), 3),
+        "agm_count": len(agms),
+        "hop_count": max(0, len(agms) - 1),
+        "min_pipeline_spacing_mi": "" if len(agms) < 2 else round(min(agms[i + 1].along_mi - agms[i].along_mi for i in range(len(agms) - 1)), 3),
+        "max_pipeline_spacing_mi": "" if len(agms) < 2 else round(max(agms[i + 1].along_mi - agms[i].along_mi for i in range(len(agms) - 1)), 3),
     }
 
-    kmz_out = build_kmz(center_coords, agms_adj)
+    kmz_out = build_kmz(center_coords, agms)
     csv_out = rows_to_csv_bytes(rows)
-    return agms_adj, hops, rows, summary, kmz_out, csv_out
+    return agms, rows, summary, kmz_out, csv_out
 
 
 st.set_page_config(page_title="AGM Planner", layout="wide")
-st.title("AGM Planner (full line, road-aware, end AGM, KMZ + table)")
+st.title("AGM Planner (prefer road crossings in 0.40–1.10)")
 
 token = st.secrets.get("MAPBOX_TOKEN", "")
 if not token:
@@ -449,32 +454,20 @@ if not token:
 if "results" not in st.session_state:
     st.session_state["results"] = None
 
-# AUTO-CLEAR stale results from older app versions
-if isinstance(st.session_state.get("results"), dict):
-    r = st.session_state["results"]
-    if "agms" not in r or "rows" not in r or "kmz_bytes" not in r:
-        st.session_state["results"] = None
-
 uploaded = st.file_uploader("Upload centerline KMZ (LineString)", type=["kmz"])
-
-c1, c2 = st.columns([1, 1])
-with c1:
-    run_btn = st.button("Generate AGMs for FULL line")
-with c2:
-    if st.button("Clear results"):
-        st.session_state["results"] = None
+run_btn = st.button("Generate AGMs for FULL line")
 
 if uploaded and run_btn:
     try:
         with st.spinner("Parsing KMZ..."):
             center = kmz_to_centerline_coords(uploaded.read())
 
-        with st.spinner("Generating AGMs (prefers ~1.00 mile spacing)..."):
-            agms_adj, hops, rows, summary, kmz_out, csv_out = generate_full_line(token, center)
+        with st.spinner("Generating AGMs (prefers road crossings)..."):
+            agms, rows, summary, kmz_out, csv_out = generate_full_line(token, center)
 
         st.session_state["results"] = {
             "center": center,
-            "agms": agms_adj,
+            "agms": agms,
             "rows": rows,
             "summary": summary,
             "kmz_bytes": kmz_out,
@@ -506,7 +499,6 @@ else:
     folium.PolyLine([(lat, lon) for (lon, lat) in center], color="#FF0000", weight=3, opacity=0.9).add_to(m)
 
     for a in agms:
-        label = agm_label(a.idx)
         folium.CircleMarker(
             location=[a.lat, a.lon],
             radius=5,
@@ -515,7 +507,7 @@ else:
             fill=True,
             fill_color="#FFEA00",
             fill_opacity=0.95,
-            tooltip=f"AGM {label}",
+            tooltip=f"AGM {agm_label(a.idx)}",
         ).add_to(m)
 
     st_folium(m, width="stretch", height=600)
