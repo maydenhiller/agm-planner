@@ -1,5 +1,4 @@
 streamlit==1.37.1
 requests==2.32.3
-pyproj==3.6.1
 folium==0.17.0
 streamlit-folium==0.22.1
