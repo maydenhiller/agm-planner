@@ -1,3 +1,4 @@
+# app.py
 import io
 import math
 import zipfile
@@ -12,16 +13,14 @@ import folium
 from streamlit_folium import st_folium
 
 
-# ---- Your rules ----
 MIN_STEP_MI = 0.40
 PREF_MAX_STEP_MI = 1.10
 MAX_STEP_MI = 1.40
 
 REACHABLE_GAP_METERS = 201.168  # 1/8 mile in meters
 
-# Candidate sampling inside each window (controls Mapbox API cost)
-CANDIDATE_STEP_MI = 0.05        # smaller = more accurate, more API calls
-MAX_CANDIDATES_PER_BAND = 40    # cap candidates per band to limit cost
+CANDIDATE_STEP_MI = 0.05
+MAX_CANDIDATES_PER_BAND = 40
 
 
 @dataclass
@@ -63,10 +62,6 @@ def haversine_m(lon1, lat1, lon2, lat2) -> float:
 
 
 def parse_first_linestring_coords_from_kml(kml_text: str) -> List[Tuple[float, float]]:
-    """
-    Returns coords as [(lon, lat), ...] from the first LineString found.
-    Works with many typical Google Earth KMLs.
-    """
     root = ET.fromstring(kml_text)
 
     def local(tag: str) -> str:
@@ -250,7 +245,8 @@ def choose_next_agm(
         if not scored:
             continue
 
-        # Rule: prefer <=1.10; only go >1.10 if preferred has NO reachable options.
+        # Prefer <= 1.10 if ANY reachable option exists there.
+        # Only use > 1.10–1.40 if preferred band has NO reachable options.
         if band_name == "preferred":
             reachable_any = any(h.reachable for _, h in scored)
             if reachable_any:
@@ -267,10 +263,8 @@ def choose_next_agm(
         chosen_cand, chosen_hop = scored[0]
         used_over = band_name == "over"
 
-        # If we found something in preferred band, we return it immediately.
         if band_name == "preferred":
             return (chosen_cand, chosen_hop, False)
-
         return (chosen_cand, chosen_hop, used_over)
 
     return None
@@ -322,19 +316,12 @@ def generate_agms_for_segment(
     return agms, hops, summary
 
 
-# ----------------- Streamlit UI -----------------
 st.set_page_config(page_title="AGM Planner", layout="wide")
 st.title("AGM Planner (KMZ → AGMs → Miles + 4-wheeler flag)")
 
-st.write(
-    "Upload a **centerline KMZ** (LineString). The app places AGMs along the pipeline with spacing "
-    "**0.40–1.40 miles** (prefers **≤1.10** unless no reachable option), then computes **AGM→AGM driving miles** "
-    "and flags hops where the route ends more than **1/8 mile (~201m)** from the next AGM."
-)
-
 token = st.secrets.get("MAPBOX_TOKEN", "")
 if not token:
-    st.error('Missing Mapbox token. In Streamlit Secrets, add:\n\nMAPBOX_TOKEN = "sk.your_secret_token_here"')
+    st.error('Missing Mapbox token in Streamlit Secrets. Add:\n\nMAPBOX_TOKEN = "sk.your_secret_token_here"')
     st.stop()
 
 uploaded = st.file_uploader("Upload KMZ file", type=["kmz"])
@@ -352,7 +339,7 @@ if uploaded and run_btn:
         kmz_bytes = uploaded.read()
         center = kmz_to_centerline_coords(kmz_bytes)
 
-    with st.spinner("Generating AGMs and calling Mapbox (this can take a bit)..."):
+    with st.spinner("Generating AGMs and calling Mapbox..."):
         agms, hops, summary = generate_agms_for_segment(token, center, float(segment_start), float(segment_len))
 
     st.subheader("Summary")
@@ -393,6 +380,5 @@ if uploaded and run_btn:
         ).add_to(m)
 
     st_folium(m, use_container_width=True, height=600)
-
 elif not uploaded:
     st.info("Upload a KMZ to begin.")
