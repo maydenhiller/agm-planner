@@ -155,12 +155,26 @@ def mapbox_directions_driving(token: str, a: Tuple[float, float], b: Tuple[float
         f"{alon},{alat};{blon},{blat}"
         f"?geometries=geojson&overview=full&access_token={token}"
     )
-    r = requests.get(url, timeout=30)
+    r = requests.get(url, timeout=60)
+    r.raise_for_status()
     return r.json()
 
 
 def hop_between(token: str, a: Agm, b: Agm) -> Hop:
-    data = mapbox_directions_driving(token, (a.lon, a.lat), (b.lon, b.lat))
+    try:
+        data = mapbox_directions_driving(token, (a.lon, a.lat), (b.lon, b.lat))
+    except Exception:
+        return Hop(
+            from_idx=a.idx,
+            to_idx=b.idx,
+            from_along_mi=a.along_mi,
+            to_along_mi=b.along_mi,
+            driving_mi=float("inf"),
+            end_gap_m=float("inf"),
+            reachable=False,
+            mapbox_ok=False,
+        )
+
     try:
         route = data["routes"][0]
         dist_m = float(route.get("distance", float("inf")))
@@ -321,6 +335,10 @@ if not token:
     st.error('Missing Mapbox token in Streamlit Secrets. Add:\n\nMAPBOX_TOKEN = "sk.your_secret_token_here"')
     st.stop()
 
+# Initialize session state for results
+if "agm_results" not in st.session_state:
+    st.session_state["agm_results"] = None
+
 uploaded = st.file_uploader("Upload KMZ file", type=["kmz"])
 
 c1, c2, c3 = st.columns(3)
@@ -331,13 +349,39 @@ with c2:
 with c3:
     run_btn = st.button("Generate AGMs")
 
+# When button is clicked, compute and SAVE into session_state
 if uploaded and run_btn:
-    with st.spinner("Parsing KMZ..."):
-        kmz_bytes = uploaded.read()
-        center = kmz_to_centerline_coords(kmz_bytes)
+    try:
+        with st.spinner("Parsing KMZ..."):
+            kmz_bytes = uploaded.read()
+            center = kmz_to_centerline_coords(kmz_bytes)
 
-    with st.spinner("Generating AGMs and calling Mapbox..."):
-        agms, hops, summary = generate_agms_for_segment(token, center, float(segment_start), float(segment_len))
+        with st.spinner("Generating AGMs and calling Mapbox..."):
+            agms, hops, summary = generate_agms_for_segment(
+                token, center, float(segment_start), float(segment_len)
+            )
+
+        st.session_state["agm_results"] = {
+            "center": center,
+            "agms": agms,
+            "hops": hops,
+            "summary": summary,
+        }
+    except Exception as e:
+        st.session_state["agm_results"] = None
+        st.error("Something went wrong while generating AGMs.")
+        st.exception(e)
+
+# Always RENDER from session_state, so it doesn't disappear
+results = st.session_state["agm_results"]
+if results is None:
+    if not uploaded:
+        st.info("Upload a KMZ to begin.")
+else:
+    center = results["center"]
+    agms = results["agms"]
+    hops = results["hops"]
+    summary = results["summary"]
 
     st.subheader("Summary")
     st.json(summary)
@@ -356,7 +400,7 @@ if uploaded and run_btn:
                 "mapbox_ok": h.mapbox_ok,
             }
         )
-    st.dataframe(hop_rows, use_container_width=True)
+    st.dataframe(hop_rows, width="stretch")
 
     st.subheader("Map")
     mid = agms[len(agms) // 2]
@@ -376,6 +420,4 @@ if uploaded and run_btn:
             tooltip=f"AGM {a.idx} @ {a.along_mi:.2f} mi",
         ).add_to(m)
 
-    st_folium(m, use_container_width=True, height=600)
-elif not uploaded:
-    st.info("Upload a KMZ to begin.")
+    st_folium(m, width="stretch", height=600)
