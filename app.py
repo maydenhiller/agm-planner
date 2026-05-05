@@ -31,7 +31,7 @@ PARK_OFFSET_MI = 0.02  # downstream favored first
 
 # candidate sampling / cost controls
 CANDIDATE_STEP_MI = 0.05
-MAX_CANDIDATES_PER_BAND = 21  # keep this modest for speed
+MAX_CANDIDATES_PER_BAND = 21  # set to 11 if you want faster
 
 
 @dataclass
@@ -221,12 +221,6 @@ def pick_next_agm_along(
     prev: Agm,
     end_along_mi: float,
 ) -> Optional[Agm]:
-    """
-    Pick next AGM by scoring candidates near TARGET_MI.
-    Primary preference: reachable (end gap <= 1/8 mile),
-    then closeness to 1.00 mile spacing,
-    then smaller driving distance, then smaller end gap.
-    """
     hard_min = prev.along_mi + HARD_MIN_MI
     hard_max = min(prev.along_mi + HARD_MAX_MI, end_along_mi)
     if hard_min > end_along_mi:
@@ -240,8 +234,6 @@ def pick_next_agm_along(
         bands.append(("preferred", pref_min, pref_max))
     bands.append(("hard", hard_min, hard_max))
 
-    best_cand = None
-
     for band_name, lo, hi in bands:
         s_values = make_s_values(lo, hi)
         scored = []
@@ -253,7 +245,6 @@ def pick_next_agm_along(
             step_mi = s - prev.along_mi
             scored.append((reachable, abs(step_mi - TARGET_MI), driving_mi, end_gap_m, ok, s, lon, lat))
 
-        # If in preferred band and any reachable exists, only consider reachable
         if band_name == "preferred" and any(x[0] for x in scored):
             scored = [x for x in scored if x[0]]
 
@@ -261,15 +252,9 @@ def pick_next_agm_along(
 
         if scored:
             r = scored[0]
-            best_cand = Agm(idx=prev.idx + 1, along_mi=r[5], lon=r[6], lat=r[7])
-            # If we got a preferred-band candidate, return immediately.
-            if band_name == "preferred":
-                return best_cand
+            return Agm(idx=prev.idx + 1, along_mi=r[5], lon=r[6], lat=r[7])
 
-            # For hard band, only use it if preferred band didn't exist OR had no options.
-            return best_cand
-
-    return best_cand
+    return None
 
 
 def adjust_for_parking(
@@ -279,10 +264,6 @@ def adjust_for_parking(
     prev: Agm,
     next_along_mi: float,
 ) -> Tuple[Tuple[float, float], str, float, float, bool]:
-    """
-    Try downstream first, then none, then upstream.
-    Returns chosen lonlat + hop metrics.
-    """
     total_mi = m_to_mi(cum_m[-1])
 
     candidates = [
@@ -363,36 +344,34 @@ def generate_full_line(
     cum_m = cumulative_distances_m(center_coords)
     total_mi = m_to_mi(cum_m[-1])
 
-    # Start AGM 000 at start of line
     lon0, lat0 = interpolate_point(center_coords, cum_m, 0.0)
     agms_raw: List[Agm] = [Agm(idx=0, along_mi=0.0, lon=lon0, lat=lat0)]
 
-    # Place interior AGMs
     while True:
         prev = agms_raw[-1]
         nxt = pick_next_agm_along(token, center_coords, cum_m, prev, total_mi)
         if nxt is None:
             break
 
-        # Stop if we'd be forced into a tiny tail and we plan to always place end AGM
         if ALWAYS_END_AGM and (total_mi - nxt.along_mi) < PREF_MIN_MI:
+            break
+
+        # guard against picking same spot repeatedly
+        if nxt.along_mi <= prev.along_mi + 1e-6:
             break
 
         agms_raw.append(nxt)
 
-        # safety to avoid infinite loops
         if len(agms_raw) > 20000:
             break
 
-    # Always add end AGM
     if ALWAYS_END_AGM:
         lonE, latE = interpolate_point(center_coords, cum_m, cum_m[-1])
-        if agms_raw[-1].along_mi < total_mi:
+        if agms_raw[-1].along_mi < total_mi - 1e-6:
             agms_raw.append(Agm(idx=agms_raw[-1].idx + 1, along_mi=total_mi, lon=lonE, lat=latE))
         else:
             agms_raw[-1] = Agm(idx=agms_raw[-1].idx, along_mi=total_mi, lon=lonE, lat=latE)
 
-    # Now compute hops + adjust pins for parking
     agms_adj = [Agm(idx=a.idx, along_mi=a.along_mi, lon=a.lon, lat=a.lat) for a in agms_raw]
     hops: List[Hop] = []
     rows: List[Dict[str, Any]] = []
@@ -402,7 +381,7 @@ def generate_full_line(
 
     for i in range(len(agms_raw) - 1):
         a = agms_adj[i]
-        b = agms_raw[i + 1]  # authoritative along_mi
+        b = agms_raw[i + 1]
 
         (lonlat, used_offset, driving_mi, end_gap_m, ok) = adjust_for_parking(
             token, center_coords, cum_m, a, b.along_mi
@@ -470,8 +449,20 @@ if not token:
 if "results" not in st.session_state:
     st.session_state["results"] = None
 
+# AUTO-CLEAR stale results from older app versions
+if isinstance(st.session_state.get("results"), dict):
+    r = st.session_state["results"]
+    if "agms" not in r or "rows" not in r or "kmz_bytes" not in r:
+        st.session_state["results"] = None
+
 uploaded = st.file_uploader("Upload centerline KMZ (LineString)", type=["kmz"])
-run_btn = st.button("Generate AGMs for FULL line")
+
+c1, c2 = st.columns([1, 1])
+with c1:
+    run_btn = st.button("Generate AGMs for FULL line")
+with c2:
+    if st.button("Clear results"):
+        st.session_state["results"] = None
 
 if uploaded and run_btn:
     try:
@@ -496,7 +487,7 @@ if uploaded and run_btn:
 
 results = st.session_state["results"]
 if results is None:
-    st.info("Upload a KMZ, then click the button to process the whole line.")
+    st.info("Upload a KMZ, then click Generate.")
 else:
     center = results["center"]
     agms = results["agms"]
