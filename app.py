@@ -10,6 +10,7 @@ import streamlit as st
 
 import folium
 from streamlit_folium import st_folium
+import simplekml
 
 
 MIN_STEP_MI = 0.40
@@ -24,7 +25,7 @@ MAX_CANDIDATES_PER_BAND = 40
 
 @dataclass
 class Agm:
-    idx: int
+    idx: int         # 0,1,2,... used for labelling 000,010,020,...
     along_mi: float
     lon: float
     lat: float
@@ -281,20 +282,18 @@ def choose_next_agm(
     return None
 
 
-def generate_agms_for_segment(
+def generate_agms_full_line(
     token: str,
     center_coords: List[Tuple[float, float]],
-    segment_start_mi: float,
-    segment_length_mi: float,
 ) -> Tuple[List[Agm], List[Hop], Dict[str, Any]]:
     cum_m = cumulative_distances_m(center_coords)
     total_mi = m_to_mi(cum_m[-1])
 
-    seg_start = max(0.0, min(segment_start_mi, total_mi))
-    seg_end = min(seg_start + segment_length_mi, total_mi)
+    seg_start = 0.0
+    seg_end = total_mi
 
     first_lon, first_lat = interpolate_point(center_coords, cum_m, mi_to_m(seg_start))
-    agms: List[Agm] = [Agm(idx=1, along_mi=seg_start, lon=first_lon, lat=first_lat)]
+    agms: List[Agm] = [Agm(idx=0, along_mi=seg_start, lon=first_lon, lat=first_lat)]
     hops: List[Hop] = []
     used_over_count = 0
 
@@ -318,6 +317,7 @@ def generate_agms_for_segment(
     summary = {
         "segment_start_mi": round(seg_start, 3),
         "segment_end_mi": round(seg_end, 3),
+        "total_line_mi": round(total_mi, 3),
         "agm_count": len(agms),
         "hop_count": len(hops),
         "total_driving_mi": round(total_driving, 2),
@@ -327,29 +327,47 @@ def generate_agms_for_segment(
     return agms, hops, summary
 
 
+def agm_label(idx: int) -> str:
+    # AGM 1 -> 000, AGM 2 -> 010, AGM 3 -> 020, ...
+    return f"{idx * 10:03d}"
+
+
+def build_kmz(center_coords: List[Tuple[float, float]], agms: List[Agm]) -> bytes:
+    kml = simplekml.Kml()
+    f_agms = kml.newfolder(name="AGMs")
+    f_center = kml.newfolder(name="Centerline")
+
+    ls = f_center.newlinestring(name="Centerline")
+    ls.coords = [(lon, lat) for (lon, lat) in center_coords]
+
+    for a in agms:
+        label = agm_label(a.idx)
+        p = f_agms.newpoint(name=f"AGM {label}", coords=[(a.lon, a.lat)])
+        p.description = f"AGM {label} at {a.along_mi:.2f} miles along line"
+
+    kml_bytes = kml.kml().encode("utf-8")
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as z:
+        z.writestr("doc.kml", kml_bytes)
+    buf.seek(0)
+    return buf.read()
+
+
 st.set_page_config(page_title="AGM Planner", layout="wide")
-st.title("AGM Planner (KMZ → AGMs → Miles + 4-wheeler flag)")
+st.title("AGM Planner (full line, AGMs + KMZ)")
 
 token = st.secrets.get("MAPBOX_TOKEN", "")
 if not token:
     st.error('Missing Mapbox token in Streamlit Secrets. Add:\n\nMAPBOX_TOKEN = "sk.your_secret_token_here"')
     st.stop()
 
-# Initialize session state for results
 if "agm_results" not in st.session_state:
     st.session_state["agm_results"] = None
 
-uploaded = st.file_uploader("Upload KMZ file", type=["kmz"])
+uploaded = st.file_uploader("Upload centerline KMZ (LineString)", type=["kmz"])
 
-c1, c2, c3 = st.columns(3)
-with c1:
-    segment_start = st.number_input("Segment start (miles along line)", min_value=0.0, value=0.0, step=1.0)
-with c2:
-    segment_len = st.number_input("Segment length (miles, typical 15–20)", min_value=1.0, max_value=25.0, value=20.0, step=1.0)
-with c3:
-    run_btn = st.button("Generate AGMs")
+run_btn = st.button("Generate AGMs for FULL line")
 
-# When button is clicked, compute and SAVE into session_state
 if uploaded and run_btn:
     try:
         with st.spinner("Parsing KMZ..."):
@@ -357,40 +375,56 @@ if uploaded and run_btn:
             center = kmz_to_centerline_coords(kmz_bytes)
 
         with st.spinner("Generating AGMs and calling Mapbox..."):
-            agms, hops, summary = generate_agms_for_segment(
-                token, center, float(segment_start), float(segment_len)
-            )
+            agms, hops, summary = generate_agms_full_line(token, center)
+
+        kmz_out = build_kmz(center, agms)
 
         st.session_state["agm_results"] = {
             "center": center,
             "agms": agms,
             "hops": hops,
             "summary": summary,
+            "kmz_bytes": kmz_out,
         }
     except Exception as e:
         st.session_state["agm_results"] = None
         st.error("Something went wrong while generating AGMs.")
         st.exception(e)
 
-# Always RENDER from session_state, so it doesn't disappear
 results = st.session_state["agm_results"]
 if results is None:
     if not uploaded:
-        st.info("Upload a KMZ to begin.")
+        st.info("Upload a KMZ to begin, then click the button to process the entire line.")
 else:
     center = results["center"]
     agms = results["agms"]
     hops = results["hops"]
     summary = results["summary"]
+    kmz_out = results["kmz_bytes"]
 
-    st.subheader("Summary")
+    st.subheader("Summary (full line)")
     st.json(summary)
+
+    st.subheader("AGMs")
+    agm_rows = []
+    for a in agms:
+        agm_rows.append(
+            {
+                "AGM_label": agm_label(a.idx),
+                "along_mi": round(a.along_mi, 3),
+                "lon": a.lon,
+                "lat": a.lat,
+            }
+        )
+    st.dataframe(agm_rows, width="stretch")
 
     st.subheader("Hops (AGM → AGM)")
     hop_rows = []
     for h in hops:
         hop_rows.append(
             {
+                "from_label": agm_label(h.from_idx),
+                "to_label": agm_label(h.to_idx),
                 "from_along_mi": round(h.from_along_mi, 3),
                 "to_along_mi": round(h.to_along_mi, 3),
                 "drive_mi": None if not math.isfinite(h.driving_mi) else round(h.driving_mi, 2),
@@ -409,6 +443,7 @@ else:
     folium.PolyLine([(lat, lon) for (lon, lat) in center], color="#00E5FF", weight=4, opacity=0.9).add_to(m)
 
     for a in agms:
+        label = agm_label(a.idx)
         folium.CircleMarker(
             location=[a.lat, a.lon],
             radius=5,
@@ -417,7 +452,15 @@ else:
             fill=True,
             fill_color="#FFEA00",
             fill_opacity=0.95,
-            tooltip=f"AGM {a.idx} @ {a.along_mi:.2f} mi",
+            tooltip=f"AGM {label} @ {a.along_mi:.2f} mi",
         ).add_to(m)
 
     st_folium(m, width="stretch", height=600)
+
+    st.subheader("Download KMZ")
+    st.download_button(
+        label="Download KMZ (AGMs + Centerline)",
+        data=kmz_out,
+        file_name="agm_output.kmz",
+        mime="application/vnd.google-earth.kmz",
+    )
