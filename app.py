@@ -13,29 +13,33 @@ from streamlit_folium import st_folium
 import simplekml
 
 
-# ---- spacing rules ----
+# ---- spacing rules (miles along pipeline) ----
 HARD_MIN_MI = 0.40
-PREF_MAX_MI = 1.10
 HARD_MAX_MI = 1.40
 
-TARGET_MI = 1.00  # only a tiebreaker now (NOT the main objective)
+# "about a mile" window you care about for normal rhythm
+PREF_LO_MI = 0.90
+PREF_HI_MI = 1.10
+TARGET_MI = 1.00
 
-# always add last AGM
+# end-of-line handling
 ALWAYS_END_AGM = True
+TAIL_MIN_MI = HARD_MIN_MI
 
-# reachability rule (truck within 1/8 mile of target)
-REACHABLE_GAP_METERS = 201.168
+# reachability / truck rule
+REACHABLE_GAP_METERS = 201.168  # 1/8 mile
 
-# parking heuristic: when aiming for a candidate, try slightly downstream first
-PARK_OFFSET_MI = 0.02  # ~105 ft
+# Mapbox scoring / anti-weird-routing heuristic
+MAX_DRIVE_STRAIGHT_RATIO = 2.75
 
-# candidate sampling / cost controls
-CANDIDATE_STEP_MI = 0.05
-MAX_CANDIDATES_PER_BAND = 21  # set to 11 for faster
+# Candidate sampling (speed)
+N_CAND_PREF = 11   # 0.40–1.10 window
+N_CAND_WIDE = 9    # 1.10–1.40 window
+N_CAND_SHORT = 7   # 0.40–0.90 window
 
-# "decent road-ish option" threshold inside 0.40–1.10
-# If nothing inside the preferred band gets within this gap, we allow 1.10–1.40.
-PREFERRED_BAND_GOOD_GAP_METERS = 400.0
+# "acceptable road crossing" proxy (meters): route end must be this close to the target point
+# Tune: lower = stricter (more likely to short-step at crossings)
+ACCEPTABLE_END_GAP_M = 350.0
 
 
 @dataclass
@@ -166,11 +170,14 @@ def mapbox_directions_driving(token: str, a: Tuple[float, float], b: Tuple[float
     return r.json()
 
 
-def route_to_lonlat(token: str, a_lonlat: Tuple[float, float], b_lonlat: Tuple[float, float]) -> Tuple[float, float, bool]:
+def route_metrics(token: str, a_lonlat: Tuple[float, float], b_lonlat: Tuple[float, float]):
+    straight_m = haversine_m(a_lonlat[0], a_lonlat[1], b_lonlat[0], b_lonlat[1])
+    straight_mi = straight_m / 1609.344
+
     try:
         data = mapbox_directions_driving(token, a_lonlat, b_lonlat)
     except Exception:
-        return (float("inf"), float("inf"), False)
+        return (float("inf"), float("inf"), False, straight_mi)
 
     try:
         route = data["routes"][0]
@@ -184,59 +191,72 @@ def route_to_lonlat(token: str, a_lonlat: Tuple[float, float], b_lonlat: Tuple[f
         else:
             end_gap = float("inf")
 
-        return (driving_mi, end_gap, True)
+        return (driving_mi, end_gap, True, straight_mi)
     except Exception:
-        return (float("inf"), float("inf"), False)
+        return (float("inf"), float("inf"), False, straight_mi)
 
 
-def make_s_values(start_s: float, end_s: float) -> List[float]:
-    vals: List[float] = []
-    s = start_s
-    while s <= end_s + 1e-9:
-        vals.append(round(s, 4))
-        s += CANDIDATE_STEP_MI
-
-    if len(vals) > MAX_CANDIDATES_PER_BAND:
-        step = max(1, len(vals) // MAX_CANDIDATES_PER_BAND)
-        vals = vals[::step]
-    return vals
+def linspace_clamped(lo: float, hi: float, n: int) -> List[float]:
+    if n <= 1:
+        return [round((lo + hi) / 2, 4)]
+    step = (hi - lo) / (n - 1)
+    return [round(lo + i * step, 4) for i in range(n)]
 
 
-def best_parking_variant_for_candidate(
-    token: str,
-    center_coords: List[Tuple[float, float]],
-    cum_m: List[float],
-    prev_agm: Agm,
-    cand_along_mi: float,
-) -> Tuple[float, float, str, float, float, bool]:
-    """
-    For this candidate along-mile, try downstream first, then none, then upstream.
-    Return the best (lon,lat, used_offset, driving_mi, end_gap_m, ok).
-    """
-    total_mi = m_to_mi(cum_m[-1])
+def score_tuple(
+    reachable: bool,
+    end_gap_m: float,
+    drive_straight_ratio: float,
+    abs_from_target: float,
+    driving_mi: float,
+) -> Tuple:
+    ratio_penalty = 0.0
+    if math.isfinite(drive_straight_ratio) and drive_straight_ratio > MAX_DRIVE_STRAIGHT_RATIO:
+        ratio_penalty = (drive_straight_ratio - MAX_DRIVE_STRAIGHT_RATIO) * 5000.0
 
-    variants = [
-        ("downstream", min(total_mi, cand_along_mi + PARK_OFFSET_MI)),
-        ("none", cand_along_mi),
-        ("upstream", max(0.0, cand_along_mi - PARK_OFFSET_MI)),
-    ]
+    return (
+        0 if reachable else 1,
+        end_gap_m + ratio_penalty,
+        abs_from_target,
+        driving_mi,
+    )
 
+
+def best_in_band(token: str, prev: Agm, center_coords: List[Tuple[float, float]], cum_m: List[float], lo: float, hi: float, n: int) -> Optional[Tuple]:
+    if lo > hi:
+        return None
+
+    s_list = linspace_clamped(lo, hi, n)
     best = None
-    for label, s in variants:
+
+    for s in s_list:
         lon, lat = interpolate_point(center_coords, cum_m, mi_to_m(s))
-        driving_mi, end_gap_m, ok = route_to_lonlat(token, (prev_agm.lon, prev_agm.lat), (lon, lat))
+        driving_mi, end_gap_m, ok, straight_mi = route_metrics(token, (prev.lon, prev.lat), (lon, lat))
+
         reachable = (end_gap_m <= REACHABLE_GAP_METERS)
 
-        # Prefer reachable immediately (downstream is tested first)
-        if reachable:
-            return (lon, lat, label, driving_mi, end_gap_m, ok)
+        if ok and math.isfinite(driving_mi) and straight_mi > 1e-6:
+            ratio = driving_mi / straight_mi
+        else:
+            ratio = float("inf")
 
-        cur = (end_gap_m, driving_mi, ok, lon, lat, label)
-        if best is None or cur[0] < best[0] or (cur[0] == best[0] and cur[1] < best[1]):
-            best = cur
+        step_mi = s - prev.along_mi
+        abs_from_target = abs(step_mi - TARGET_MI)
 
-    assert best is not None
-    return (best[3], best[4], best[5], best[1], best[0], best[2])
+        stuple = score_tuple(reachable, end_gap_m, ratio, abs_from_target, driving_mi)
+        cand = (stuple, s, lon, lat, end_gap_m, reachable, step_mi)
+
+        if best is None or cand[0] < best[0]:
+            best = cand
+
+    return best
+
+
+def acceptable_crossing(best: Optional[Tuple]) -> bool:
+    if best is None:
+        return False
+    end_gap_m = best[4]
+    return math.isfinite(end_gap_m) and end_gap_m <= ACCEPTABLE_END_GAP_M
 
 
 def pick_next_agm(
@@ -246,74 +266,47 @@ def pick_next_agm(
     prev: Agm,
     end_along_mi: float,
 ) -> Optional[Agm]:
-    """
-    Your requested rule:
-    - Prefer road crossings in 0.40–1.10 (i.e., prefer smallest end-gap in that band)
-    - Only if that band has no decent road-ish option, allow 1.10–1.40
-    """
-    hard_min = prev.along_mi + HARD_MIN_MI
-    if hard_min > end_along_mi:
+    prev_along = prev.along_mi
+    if prev_along >= end_along_mi - 1e-6:
         return None
 
-    band1_lo = hard_min
-    band1_hi = min(prev.along_mi + PREF_MAX_MI, end_along_mi)
+    # 0.40–0.90 (short crossings)
+    band_short_lo = prev_along + HARD_MIN_MI
+    band_short_hi = min(prev_along + PREF_LO_MI, end_along_mi)
 
-    band2_lo = max(band1_hi, prev.along_mi + PREF_MAX_MI)
-    band2_hi = min(prev.along_mi + HARD_MAX_MI, end_along_mi)
+    # 0.40–1.10 (main band: includes short + up to 1.10)
+    band_main_lo = prev_along + HARD_MIN_MI
+    band_main_hi = min(prev_along + PREF_HI_MI, end_along_mi)
 
-    def score_band(lo: float, hi: float) -> List[Tuple]:
-        if lo > hi:
-            return []
-        s_values = make_s_values(lo, hi)
-        scored = []
-        for s in s_values:
-            lon, lat, used_offset, driving_mi, end_gap_m, ok = best_parking_variant_for_candidate(
-                token, center_coords, cum_m, prev, s
-            )
-            step_mi = s - prev.along_mi
-            reachable = (end_gap_m <= REACHABLE_GAP_METERS)
+    # 1.10–1.40 (wide band)
+    band_wide_lo = max(prev_along + PREF_HI_MI, prev_along + HARD_MIN_MI)
+    band_wide_hi = min(prev_along + HARD_MAX_MI, end_along_mi)
 
-            # IMPORTANT scoring: road/access first, then ~1 mile tiebreak
-            scored.append(
-                (
-                    0 if reachable else 1,          # reachable first
-                    end_gap_m,                      # then closest-to-road
-                    driving_mi,                     # then shortest drive
-                    abs(step_mi - TARGET_MI),       # then closest-to-1-mile spacing
-                    s, lon, lat, used_offset, ok
-                )
-            )
-        scored.sort(key=lambda x: (x[0], x[1], x[2], x[3]))
-        return scored
+    best_main = best_in_band(token, prev, center_coords, cum_m, band_main_lo, band_main_hi, N_CAND_PREF)
+    best_short = best_in_band(token, prev, center_coords, cum_m, band_short_lo, band_short_hi, N_CAND_SHORT)
+    best_wide = best_in_band(token, prev, center_coords, cum_m, band_wide_lo, band_wide_hi, N_CAND_WIDE)
 
-    band1 = score_band(band1_lo, band1_hi)
-    if band1:
-        # if we have a "good enough" road-ish option in preferred band, take it.
-        if band1[0][1] <= PREFERRED_BAND_GOOD_GAP_METERS:
-            best = band1[0]
-            return Agm(idx=prev.idx + 1, along_mi=best[4], lon=best[5], lat=best[6])
+    # 1) If we have an acceptable crossing <= 1.10, take it.
+    if acceptable_crossing(best_main):
+        _, s, lon, lat, _, _, _ = best_main
+        return Agm(idx=prev.idx + 1, along_mi=s, lon=lon, lat=lat)
 
-        # even if not "good", we still prefer band1 unless band2 is clearly better
-        band2 = score_band(band2_lo, band2_hi)
-        if not band2:
-            best = band1[0]
-            return Agm(idx=prev.idx + 1, along_mi=best[4], lon=best[5], lat=best[6])
+    # 2) If wide would push >1.10, but we have acceptable crossings in 0.40–0.90, take short.
+    if best_wide is not None and best_wide[6] > 1.10 and acceptable_crossing(best_short):
+        _, s, lon, lat, _, _, _ = best_short
+        return Agm(idx=prev.idx + 1, along_mi=s, lon=lon, lat=lat)
 
-        # allow band2 only if it significantly improves road access
-        # (smaller end-gap wins; if tie, band scoring already handled)
-        if band2[0][1] + 1e-6 < band1[0][1]:
-            best = band2[0]
-            return Agm(idx=prev.idx + 1, along_mi=best[4], lon=best[5], lat=best[6])
+    # 3) Otherwise use best main if present (even if not "acceptable crossing")
+    if best_main is not None:
+        _, s, lon, lat, _, _, _ = best_main
+        return Agm(idx=prev.idx + 1, along_mi=s, lon=lon, lat=lat)
 
-        best = band1[0]
-        return Agm(idx=prev.idx + 1, along_mi=best[4], lon=best[5], lat=best[6])
+    # 4) Finally allow wide
+    if best_wide is not None:
+        _, s, lon, lat, _, _, _ = best_wide
+        return Agm(idx=prev.idx + 1, along_mi=s, lon=lon, lat=lat)
 
-    # no band1 candidates (rare), fall back to band2
-    band2 = score_band(band2_lo, band2_hi)
-    if not band2:
-        return None
-    best = band2[0]
-    return Agm(idx=prev.idx + 1, along_mi=best[4], lon=best[5], lat=best[6])
+    return None
 
 
 def build_kmz(center_coords: List[Tuple[float, float]], agms: List[Agm]) -> bytes:
@@ -371,19 +364,21 @@ def generate_full_line(token: str, center_coords: List[Tuple[float, float]]):
     lon0, lat0 = interpolate_point(center_coords, cum_m, 0.0)
     agms: List[Agm] = [Agm(idx=0, along_mi=0.0, lon=lon0, lat=lat0)]
 
-    # generate interior points
     while True:
         prev = agms[-1]
+        remaining = total_mi - prev.along_mi
+
+        if remaining <= 1e-6:
+            break
+
+        if ALWAYS_END_AGM and remaining < TAIL_MIN_MI:
+            break
+
         nxt = pick_next_agm(token, center_coords, cum_m, prev, total_mi)
         if nxt is None:
             break
 
-        # prevent duplicates / non-progress
         if nxt.along_mi <= prev.along_mi + 1e-6:
-            break
-
-        # if we're near the end, stop and we'll add the end AGM
-        if ALWAYS_END_AGM and (total_mi - nxt.along_mi) < HARD_MIN_MI:
             break
 
         agms.append(nxt)
@@ -391,7 +386,6 @@ def generate_full_line(token: str, center_coords: List[Tuple[float, float]]):
         if len(agms) > 20000:
             break
 
-    # force end AGM
     if ALWAYS_END_AGM:
         lonE, latE = interpolate_point(center_coords, cum_m, cum_m[-1])
         if agms[-1].along_mi < total_mi - 1e-6:
@@ -399,7 +393,6 @@ def generate_full_line(token: str, center_coords: List[Tuple[float, float]]):
         else:
             agms[-1] = Agm(idx=agms[-1].idx, along_mi=total_mi, lon=lonE, lat=latE)
 
-    # build one output table
     rows: List[Dict[str, Any]] = []
     cum_pipe = 0.0
     cum_drive = 0.0
@@ -411,7 +404,7 @@ def generate_full_line(token: str, center_coords: List[Tuple[float, float]]):
         pipe_seg = b.along_mi - a.along_mi
         cum_pipe += pipe_seg
 
-        driving_mi, end_gap_m, ok = route_to_lonlat(token, (a.lon, a.lat), (b.lon, b.lat))
+        driving_mi, end_gap_m, ok, _ = route_metrics(token, (a.lon, a.lat), (b.lon, b.lat))
         reachable = (end_gap_m <= REACHABLE_GAP_METERS)
 
         if math.isfinite(driving_mi):
@@ -434,8 +427,12 @@ def generate_full_line(token: str, center_coords: List[Tuple[float, float]]):
         "total_line_mi": round(total_mi, 3),
         "agm_count": len(agms),
         "hop_count": max(0, len(agms) - 1),
-        "min_pipeline_spacing_mi": "" if len(agms) < 2 else round(min(agms[i + 1].along_mi - agms[i].along_mi for i in range(len(agms) - 1)), 3),
-        "max_pipeline_spacing_mi": "" if len(agms) < 2 else round(max(agms[i + 1].along_mi - agms[i].along_mi for i in range(len(agms) - 1)), 3),
+        "min_pipeline_spacing_mi": "" if len(agms) < 2 else round(
+            min(agms[i + 1].along_mi - agms[i].along_mi for i in range(len(agms) - 1)), 3
+        ),
+        "max_pipeline_spacing_mi": "" if len(agms) < 2 else round(
+            max(agms[i + 1].along_mi - agms[i].along_mi for i in range(len(agms) - 1)), 3
+        ),
     }
 
     kmz_out = build_kmz(center_coords, agms)
@@ -444,7 +441,7 @@ def generate_full_line(token: str, center_coords: List[Tuple[float, float]]):
 
 
 st.set_page_config(page_title="AGM Planner", layout="wide")
-st.title("AGM Planner (prefer road crossings in 0.40–1.10)")
+st.title("AGM Planner (prefer crossings in 0.40–1.10; short-step 0.40–0.90 when needed)")
 
 token = st.secrets.get("MAPBOX_TOKEN", "")
 if not token:
@@ -454,15 +451,26 @@ if not token:
 if "results" not in st.session_state:
     st.session_state["results"] = None
 
+if isinstance(st.session_state.get("results"), dict):
+    r = st.session_state["results"]
+    if not {"agms", "rows", "kmz_bytes", "csv_bytes"}.issubset(r.keys()):
+        st.session_state["results"] = None
+
 uploaded = st.file_uploader("Upload centerline KMZ (LineString)", type=["kmz"])
-run_btn = st.button("Generate AGMs for FULL line")
+
+c1, c2 = st.columns([1, 1])
+with c1:
+    run_btn = st.button("Generate AGMs for FULL line")
+with c2:
+    if st.button("Clear results"):
+        st.session_state["results"] = None
 
 if uploaded and run_btn:
     try:
         with st.spinner("Parsing KMZ..."):
             center = kmz_to_centerline_coords(uploaded.read())
 
-        with st.spinner("Generating AGMs (prefers road crossings)..."):
+        with st.spinner("Generating AGMs..."):
             agms, rows, summary, kmz_out, csv_out = generate_full_line(token, center)
 
         st.session_state["results"] = {
