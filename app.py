@@ -245,8 +245,6 @@ def choose_next_agm(
         if not scored:
             continue
 
-        # Prefer <= 1.10 if ANY reachable option exists there.
-        # Only use > 1.10–1.40 if preferred band has NO reachable options.
         if band_name == "preferred":
             reachable_any = any(h.reachable for _, h in scored)
             if reachable_any:
