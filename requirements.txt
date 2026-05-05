@@ -1,4 +1,4 @@
-# requirements.txt
+requirements.txt
 streamlit==1.37.1
 requests==2.32.3
 folium==0.17.0
